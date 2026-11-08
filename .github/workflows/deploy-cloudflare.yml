@@ -256,12 +256,53 @@ jobs:
             echo "BETTER_AUTH_SECRET already set, skipping"
           fi
 
+      - name: Limit cron triggers for Workers Free plan
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          path = Path("wrangler.toml")
+          config = path.read_text()
+
+          pattern = r'(?m)^crons\s*=\s*\[(.*?)\]\s*$'
+          match = re.search(pattern, config)
+
+          if not match:
+              raise SystemExit("Cannot find triggers.crons in wrangler.toml")
+
+          crons = re.findall(r'"([^"]+)"', match.group(1))
+
+          # Instance telemetry is optional; disable it on Workers Free.
+          telemetry_cron = "0 */12 * * *"
+
+          if telemetry_cron in crons:
+              crons.remove(telemetry_cron)
+
+          if len(crons) > 5:
+              raise SystemExit(
+                  f"Still have {len(crons)} cron triggers; Workers Free allows 5."
+              )
+
+          replacement = "crons = [" + ", ".join(
+              f'"{cron}"' for cron in crons
+          ) + "]"
+
+          config = config[:match.start()] + replacement + config[match.end():]
+          path.write_text(config)
+
+          print("Configured cron triggers:")
+          for cron in crons:
+              print(f"  {cron}")
+          PY
+
       # vite build runs the @cloudflare/vite-plugin, which writes the deploy
       # config (dist/zpan/wrangler.json) that the subsequent wrangler deploy
       # consumes: it resolves the assets directory to dist/client and inlines
       # build-time defines. Must run after the D1 id patch so the generated
       # config carries the real database_id. ZPAN_APP_VERSION sidesteps a git
       # describe on the shallow tag checkout.
+
       - name: Build
         env:
           ZPAN_APP_VERSION: ${{ steps.release.outputs.version }}
