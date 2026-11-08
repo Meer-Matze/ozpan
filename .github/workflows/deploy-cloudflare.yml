@@ -168,7 +168,77 @@ jobs:
 
       - name: Patch wrangler.toml with D1 database ID
         run: sed -i "s/database_id = \"[^\"]*\"/database_id = \"${{ steps.d1.outputs.id }}\"/" wrangler.toml
+  
+      - name: Ensure KV namespace exists
+        id: kv
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          API="https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/storage/kv/namespaces"
 
+          # 查询当前账户是否已经存在 CACHE_KV
+          RESPONSE=$(curl -sf "$API?per_page=1000" \
+            -H "Authorization: Bearer $CF_API_TOKEN")
+
+          KV_ID=$(echo "$RESPONSE" | jq -r \
+            '.result[] | select(.title == "CACHE_KV") | .id' | head -n 1)
+
+          # 不存在则创建
+          if [ -z "$KV_ID" ]; then
+            RESPONSE=$(curl -sf -X POST "$API" \
+              -H "Authorization: Bearer $CF_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d '{"title":"CACHE_KV"}')
+
+            KV_ID=$(echo "$RESPONSE" | jq -r '.result.id')
+            echo "Created KV namespace: CACHE_KV"
+          else
+            echo "Reusing KV namespace: CACHE_KV"
+          fi
+
+          if [ -z "$KV_ID" ] || [ "$KV_ID" = "null" ]; then
+            echo "::error::Failed to obtain KV namespace ID"
+            exit 1
+          fi
+
+          echo "id=$KV_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Patch wrangler.toml with KV namespace ID
+        env:
+          KV_ID: ${{ steps.kv.outputs.id }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+
+          path = "wrangler.toml"
+          with open(path, "r") as f:
+              config = f.read()
+
+          # 只替换生产环境的 CACHE_KV，不修改 previews 配置
+          pattern = (
+              r'(\[\[kv_namespaces\]\]\s*'
+              r'binding\s*=\s*"CACHE_KV"\s*'
+              r'id\s*=\s*")[^"]+(")'
+          )
+
+          config, count = re.subn(
+              pattern,
+              lambda m: m.group(1) + os.environ["KV_ID"] + m.group(2),
+              config,
+              count=1,
+          )
+
+          if count != 1:
+              raise SystemExit("Failed to patch production CACHE_KV namespace ID")
+
+          with open(path, "w") as f:
+              f.write(config)
+
+          print("Patched production CACHE_KV namespace ID")
+          PY
+          
       - name: Set BETTER_AUTH_SECRET (first deploy only)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
